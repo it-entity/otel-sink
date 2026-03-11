@@ -1,0 +1,113 @@
+services:
+  collector:
+    build: .
+    ports:
+      - "4318:4318"
+      - "6060:6060"
+    environment:
+      CLICKHOUSE_DSN: "clickhouse://default:@clickhouse:9000/otel"
+      RABBITMQ_URL: "amqp://guest:guest@rabbitmq-1:5672/"
+      BATCH_SIZE: "5000"
+    deploy:
+      resources:
+        limits:
+          memory: 200M
+    depends_on:
+      - clickhouse
+      - rabbitmq-init
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    ports:
+      - "9000:9000"
+      - "8123:8123"
+    volumes:
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./clickhouse/users.xml:/etc/clickhouse-server/users.d/users.xml:ro
+      - clickhouse_data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    environment:
+      CLICKHOUSE_DB: otel
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+
+  rabbitmq-1:
+    image: rabbitmq:3.13-management-alpine
+    hostname: rabbitmq-1
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_ERLANG_COOKIE: "otel-cluster-cookie"
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+      RABBITMQ_NODENAME: rabbit@rabbitmq-1
+    volumes:
+      - rmq1_data:/var/lib/rabbitmq
+
+  rabbitmq-2:
+    image: rabbitmq:3.13-management-alpine
+    hostname: rabbitmq-2
+    ports:
+      - "5673:5672"
+      - "15673:15672"
+    environment:
+      RABBITMQ_ERLANG_COOKIE: "otel-cluster-cookie"
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+      RABBITMQ_NODENAME: rabbit@rabbitmq-2
+    depends_on:
+      - rabbitmq-1
+
+  rabbitmq-3:
+    image: rabbitmq:3.13-management-alpine
+    hostname: rabbitmq-3
+    ports:
+      - "5674:5672"
+      - "15674:15672"
+    environment:
+      RABBITMQ_ERLANG_COOKIE: "otel-cluster-cookie"
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+      RABBITMQ_NODENAME: rabbit@rabbitmq-3
+    depends_on:
+      - rabbitmq-1
+
+  rabbitmq-init:
+    image: rabbitmq:3.13-management-alpine
+    depends_on:
+      - rabbitmq-1
+      - rabbitmq-2
+      - rabbitmq-3
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    environment:
+      RABBITMQ_ERLANG_COOKIE: "otel-cluster-cookie"
+    command:
+      - |
+        sleep 15
+        echo "Joining node 2 to cluster..."
+        rabbitmqctl -n rabbit@rabbitmq-2 stop_app
+        rabbitmqctl -n rabbit@rabbitmq-2 reset
+        rabbitmqctl -n rabbit@rabbitmq-2 join_cluster rabbit@rabbitmq-1
+        rabbitmqctl -n rabbit@rabbitmq-2 start_app
+
+        echo "Joining node 3 to cluster..."
+        rabbitmqctl -n rabbit@rabbitmq-3 stop_app
+        rabbitmqctl -n rabbit@rabbitmq-3 reset
+        rabbitmqctl -n rabbit@rabbitmq-3 join_cluster rabbit@rabbitmq-1
+        rabbitmqctl -n rabbit@rabbitmq-3 start_app
+
+        echo "Setting HA policy..."
+        rabbitmqctl -n rabbit@rabbitmq-1 set_policy ha-otel "^otel\." '{"ha-mode":"all","ha-sync-mode":"automatic"}' --apply-to queues
+
+        echo "Cluster ready."
+        rabbitmqctl -n rabbit@rabbitmq-1 cluster_status
+
+volumes:
+  clickhouse_data:
+  rmq1_data:
