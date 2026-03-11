@@ -12,7 +12,6 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -23,8 +22,6 @@ import (
 	"dummy-tracers/clickhouse"
 	"dummy-tracers/queue"
 )
-
-var tracesPool = sync.Pool{New: func() any { return make([]byte, 0, 16*1024) }}
 
 // analytics counters
 var (
@@ -39,11 +36,11 @@ var (
 	latencySum     atomic.Int64
 )
 
-const maxConcurrent = 256
+const maxConcurrent = 1024
 const maxBodySize = 4 * 1024 * 1024
 
 func main() {
-	debug.SetMemoryLimit(170 * 1024 * 1024) // leave headroom under 200MB container limit
+	debug.SetMemoryLimit(350 * 1024 * 1024)
 
 	log := zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: "15:04:05"}).
 		With().Timestamp().Logger()
@@ -80,19 +77,17 @@ func main() {
 	}
 	defer consumer.Close()
 
-	sem := make(chan struct{}, maxConcurrent)
-
 	app := fiber.New(fiber.Config{
 		DisableStartupMessage: true,
-		ReduceMemoryUsage:     true,
-		Concurrency:           maxConcurrent * 4,
-		BodyLimit:             maxBodySize,
-		ReadBufferSize:        8192,
+		Concurrency:          maxConcurrent * 4,
+		BodyLimit:            maxBodySize,
+		ReadBufferSize:       4096,
+		WriteBufferSize:      4096,
 	})
 
-	app.Post("/v1/traces", makeHandler(log, queue.QueueTraces, &traceCount, sem, publisher))
-	app.Post("/v1/metrics", makeHandler(log, queue.QueueMetrics, &metricCount, sem, publisher))
-	app.Post("/v1/logs", makeHandler(log, queue.QueueLogs, &logCount, sem, publisher))
+	app.Post("/v1/traces", makeHandler(queue.QueueTraces, &traceCount, publisher))
+	app.Post("/v1/metrics", makeHandler(queue.QueueMetrics, &metricCount, publisher))
+	app.Post("/v1/logs", makeHandler(queue.QueueLogs, &logCount, publisher))
 	app.Get("/stats", statsHandler())
 
 	go reportStats(log)
@@ -111,11 +106,8 @@ func main() {
 	app.Shutdown()
 }
 
-func makeHandler(log zerolog.Logger, queueName string, counter *atomic.Int64, sem chan struct{}, pub *queue.Publisher) fiber.Handler {
+func makeHandler(queueName string, counter *atomic.Int64, pub *queue.Publisher) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		sem <- struct{}{}
-		defer func() { <-sem }()
-
 		start := time.Now()
 		active := activeRequests.Add(1)
 		defer activeRequests.Add(-1)
@@ -130,29 +122,17 @@ func makeHandler(log zerolog.Logger, queueName string, counter *atomic.Int64, se
 		body, err := decompress(c)
 		if err != nil {
 			errorCount.Add(1)
-			log.Error().Err(err).Str("endpoint", c.Path()).Msg("failed to decompress")
 			return c.SendStatus(fiber.StatusBadRequest)
 		}
 
-		// publish raw protobuf to rabbitmq — no decode in hot path
-		if err := pub.Publish(c.Context(), queueName, body); err != nil {
-			errorCount.Add(1)
-			log.Error().Err(err).Str("queue", queueName).Msg("failed to publish")
-			return c.SendStatus(fiber.StatusInternalServerError)
-		}
+		// async fire-and-forget publish — does not block on RabbitMQ
+		pub.Publish(context.Background(), queueName, body)
 
 		elapsed := time.Since(start)
 		latencySum.Add(elapsed.Microseconds())
 		totalRequests.Add(1)
 		totalBytes.Add(int64(len(body)))
 		counter.Add(1)
-
-		log.Info().
-			Str("endpoint", c.Path()).
-			Int("size", len(body)).
-			Dur("latency", elapsed).
-			Int64("active", active).
-			Msg("received")
 
 		return c.SendStatus(fiber.StatusOK)
 	}
@@ -256,7 +236,6 @@ func getRSSMB() uint64 {
 	if err != nil {
 		return 0
 	}
-	// statm fields: size resident shared text lib data dt (in pages)
 	var size, resident uint64
 	fmt.Sscanf(string(data), "%d %d", &size, &resident)
 	pageSize := uint64(os.Getpagesize())
