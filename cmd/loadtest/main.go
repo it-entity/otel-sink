@@ -39,7 +39,7 @@ type signalStats struct {
 
 func main() {
 	fmt.Println("╔══════════════════════════════════════════════════════════╗")
-	fmt.Println("║    OOM STRESS TEST — Scale until 200MB container dies   ║")
+	fmt.Println("║    STRESS TEST — Target 10K RPS                         ║")
 	fmt.Println("╚══════════════════════════════════════════════════════════╝")
 	fmt.Println()
 
@@ -60,8 +60,8 @@ func main() {
 		{baseURL + "/v1/logs", logPayload, &signalStats{name: "logs"}},
 	}
 
-	// escalating concurrency: 100 → 200 → 400 → 600 → 800 → 1000 → 1500 → 2000
-	levels := []int{100, 200, 400, 600, 800, 1000, 1500, 2000}
+	// escalating concurrency
+	levels := []int{200, 400, 800, 1200, 1600, 2000, 3000, 4000}
 	phaseDuration := 20 * time.Second
 
 	totalStart := time.Now()
@@ -83,7 +83,12 @@ func main() {
 			Transport: &http.Transport{
 				MaxIdleConns:        concurrency * 2,
 				MaxIdleConnsPerHost: concurrency,
-				IdleConnTimeout:     30 * time.Second,
+				MaxConnsPerHost:     concurrency,
+				IdleConnTimeout:     90 * time.Second,
+				DisableCompression:  true,
+				ForceAttemptHTTP2:   false,
+				WriteBufferSize:     32768,
+				ReadBufferSize:      4096,
 			},
 		}
 
@@ -107,6 +112,7 @@ func main() {
 				wg.Add(1)
 				go func(url string, payload []byte, stats *signalStats) {
 					defer wg.Done()
+					consecutiveFails := 0
 					for time.Now().Before(deadline) && !oomDetected.Load() {
 						start := time.Now()
 						resp, err := client.Post(url, "application/x-protobuf", bytes.NewReader(payload))
@@ -116,12 +122,16 @@ func main() {
 
 						if err != nil {
 							stats.errors.Add(1)
-							// connection refused = server died
+							// need 10 consecutive fast failures to confirm OOM
 							if elapsed < 100*time.Millisecond {
-								oomDetected.Store(true)
+								consecutiveFails++
+								if consecutiveFails >= 10 {
+									oomDetected.Store(true)
+								}
 							}
 							continue
 						}
+						consecutiveFails = 0
 						resp.Body.Close()
 						if resp.StatusCode != 200 {
 							stats.errors.Add(1)

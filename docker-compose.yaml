@@ -8,10 +8,11 @@ services:
       CLICKHOUSE_DSN: "clickhouse://default:@clickhouse:9000/otel"
       RABBITMQ_URL: "amqp://guest:guest@rabbitmq-1:5672/"
       BATCH_SIZE: "5000"
+      QUEUE_BACKEND: "rabbitmq"
     deploy:
       resources:
         limits:
-          memory: 400M
+          memory: 1G
     depends_on:
       - clickhouse
       - rabbitmq-init

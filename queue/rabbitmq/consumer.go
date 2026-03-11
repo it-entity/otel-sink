@@ -1,4 +1,4 @@
-package queue
+package rabbitmq
 
 import (
 	"context"
@@ -9,21 +9,22 @@ import (
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/rs/zerolog"
+	"google.golang.org/protobuf/proto"
 
 	"dummy-tracers/clickhouse"
+	"dummy-tracers/queue"
 
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
-	"google.golang.org/protobuf/proto"
 )
 
 const (
-	minWorkers     = 1
-	maxWorkers     = 8
-	scaleUpThresh  = 500   // pending msgs to trigger scale up
-	scaleDownThresh = 10   // pending msgs to trigger scale down
-	scaleInterval  = 5 * time.Second
+	minWorkers      = 1
+	maxWorkers      = 8
+	scaleUpThresh   = 500
+	scaleDownThresh = 10
+	scaleInterval   = 5 * time.Second
 )
 
 type Consumer struct {
@@ -39,7 +40,6 @@ type queueWorkerPool struct {
 	mu          sync.Mutex
 	workers     int32
 	activeCount atomic.Int32
-	cancel      context.CancelFunc
 	workerWg    sync.WaitGroup
 }
 
@@ -60,38 +60,21 @@ func NewConsumer(ctx context.Context, url string, chClient *clickhouse.Client, b
 	}
 
 	c.wg.Add(3)
-	go c.managePool(cctx, QueueTraces, c.flushTraceBatch)
-	go c.managePool(cctx, QueueMetrics, c.flushMetricBatch)
-	go c.managePool(cctx, QueueLogs, c.flushLogBatch)
+	go c.managePool(cctx, queue.QueueTraces, c.flushTraceBatch)
+	go c.managePool(cctx, queue.QueueMetrics, c.flushMetricBatch)
+	go c.managePool(cctx, queue.QueueLogs, c.flushLogBatch)
 
 	log.Info().Int("batch_size", batchSize).Int("min_workers", minWorkers).Int("max_workers", maxWorkers).Msg("rabbitmq consumer started")
 	return c, nil
 }
 
-func dialWithRetry(url string, log zerolog.Logger) (*amqp.Connection, error) {
-	var conn *amqp.Connection
-	var err error
-	for i := 0; i < 5; i++ {
-		conn, err = amqp.Dial(url)
-		if err == nil {
-			return conn, nil
-		}
-		log.Warn().Err(err).Int("attempt", i+1).Msg("rabbitmq connect failed, retrying")
-		time.Sleep(2 * time.Second)
-	}
-	return nil, err
-}
-
-// managePool monitors queue depth and scales workers up/down.
 func (c *Consumer) managePool(ctx context.Context, queueName string, flush func([]amqp.Delivery)) {
 	defer c.wg.Done()
 
 	pool := &queueWorkerPool{}
 	poolCtx, poolCancel := context.WithCancel(ctx)
-	pool.cancel = poolCancel
 	defer poolCancel()
 
-	// start minimum workers
 	for i := 0; i < minWorkers; i++ {
 		c.addWorker(poolCtx, pool, queueName, flush)
 	}
@@ -110,19 +93,9 @@ func (c *Consumer) managePool(ctx context.Context, queueName string, flush func(
 
 			if depth > scaleUpThresh && current < maxWorkers {
 				c.addWorker(poolCtx, pool, queueName, flush)
-				c.log.Info().
-					Str("queue", queueName).
-					Int32("workers", pool.activeCount.Load()).
-					Int("depth", depth).
-					Msg("scaled up consumer")
+				c.log.Info().Str("queue", queueName).Int32("workers", pool.activeCount.Load()).Int("depth", depth).Msg("scaled up consumer")
 			} else if depth < scaleDownThresh && current > minWorkers {
-				// scale down by cancelling the pool context and restarting with fewer
-				// Instead, we let idle workers exit naturally via the scaleDown flag
-				c.log.Info().
-					Str("queue", queueName).
-					Int32("workers", current).
-					Int("depth", depth).
-					Msg("queue depth low, workers will scale down naturally")
+				c.log.Info().Str("queue", queueName).Int32("workers", current).Int("depth", depth).Msg("queue depth low, workers will scale down naturally")
 			}
 		}
 	}
@@ -151,12 +124,10 @@ func (c *Consumer) workerLoop(ctx context.Context, pool *queueWorkerPool, queueN
 		if ctx.Err() != nil {
 			return
 		}
-
 		err := c.consumeOnce(ctx, pool, queueName, tag, flush)
 		if ctx.Err() != nil {
 			return
 		}
-
 		c.log.Warn().Err(err).Str("queue", queueName).Str("worker", tag).Msg("worker disconnected, reconnecting in 3s")
 		select {
 		case <-ctx.Done():
@@ -206,14 +177,12 @@ func (c *Consumer) consumeOnce(ctx context.Context, pool *queueWorkerPool, queue
 		case <-ctx.Done():
 			flush(batch)
 			return nil
-
 		case amqpErr := <-connErr:
 			flush(batch)
 			if amqpErr != nil {
 				return amqpErr
 			}
 			return nil
-
 		case msg, ok := <-msgs:
 			if !ok {
 				flush(batch)
@@ -225,7 +194,6 @@ func (c *Consumer) consumeOnce(ctx context.Context, pool *queueWorkerPool, queue
 				flush(batch)
 				batch = make([]amqp.Delivery, 0, c.batchSize)
 			}
-
 		case <-ticker.C:
 			if len(batch) > 0 {
 				flush(batch)
@@ -233,7 +201,6 @@ func (c *Consumer) consumeOnce(ctx context.Context, pool *queueWorkerPool, queue
 				idleCount = 0
 			} else {
 				idleCount++
-				// if idle for 3 ticks (15s) and we have more than min workers, exit
 				if idleCount >= 3 && pool.activeCount.Load() > minWorkers {
 					c.log.Info().Str("queue", queueName).Str("worker", tag).Msg("idle worker scaling down")
 					return nil
@@ -281,7 +248,6 @@ func (c *Consumer) flushTraceBatch(msgs []amqp.Delivery) {
 		c.chClient.AddTraces(allRows)
 	}
 	msgs[len(msgs)-1].Ack(true)
-	c.log.Info().Int("messages", len(msgs)).Int("rows", len(allRows)).Msg("flushed trace batch")
 }
 
 func (c *Consumer) flushMetricBatch(msgs []amqp.Delivery) {
@@ -302,7 +268,6 @@ func (c *Consumer) flushMetricBatch(msgs []amqp.Delivery) {
 		c.chClient.AddMetrics(allRows)
 	}
 	msgs[len(msgs)-1].Ack(true)
-	c.log.Info().Int("messages", len(msgs)).Int("rows", len(allRows)).Msg("flushed metric batch")
 }
 
 func (c *Consumer) flushLogBatch(msgs []amqp.Delivery) {
@@ -323,7 +288,6 @@ func (c *Consumer) flushLogBatch(msgs []amqp.Delivery) {
 		c.chClient.AddLogs(allRows)
 	}
 	msgs[len(msgs)-1].Ack(true)
-	c.log.Info().Int("messages", len(msgs)).Int("rows", len(allRows)).Msg("flushed log batch")
 }
 
 func (c *Consumer) Close() {

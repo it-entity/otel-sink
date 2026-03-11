@@ -3,7 +3,7 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o /dummy-tracers .
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /dummy-tracers .
 
 FROM alpine:3.20
 COPY --from=builder /dummy-tracers /dummy-tracers

@@ -1,0 +1,48 @@
+services:
+  collector:
+    build: .
+    network_mode: host
+    environment:
+      CLICKHOUSE_DSN: "clickhouse://default:@localhost:9000/otel"
+      REDIS_URL: "redis://localhost:6380"
+      BATCH_SIZE: "5000"
+      QUEUE_BACKEND: "redis"
+    deploy:
+      resources:
+        limits:
+          memory: 400M
+    depends_on:
+      - clickhouse
+      - redis
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    ports:
+      - "9000:9000"
+      - "8123:8123"
+    volumes:
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./clickhouse/users.xml:/etc/clickhouse-server/users.d/users.xml:ro
+      - clickhouse_data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    environment:
+      CLICKHOUSE_DB: otel
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --save ""
+    deploy:
+      resources:
+        limits:
+          memory: 300M
+
+volumes:
+  clickhouse_data:

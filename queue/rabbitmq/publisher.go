@@ -1,4 +1,4 @@
-package queue
+package rabbitmq
 
 import (
 	"context"
@@ -7,17 +7,21 @@ import (
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/rs/zerolog"
+
+	"dummy-tracers/queue"
 )
 
 const (
-	QueueTraces  = "otel.traces"
-	QueueMetrics = "otel.metrics"
-	QueueLogs    = "otel.logs"
-
-	publisherPoolSize = 4
-	batchFlushSize    = 64
-	batchFlushDelay   = 25 * time.Millisecond
+	publisherPoolSize = 8
+	batchFlushSize    = 256
+	batchFlushDelay   = 5 * time.Millisecond
 )
+
+var bodyPool = sync.Pool{
+	New: func() any {
+		return make([]byte, 0, 16384)
+	},
+}
 
 type publishMsg struct {
 	queue string
@@ -36,10 +40,9 @@ type Publisher struct {
 func NewPublisher(ctx context.Context, url string, log zerolog.Logger) (*Publisher, error) {
 	p := &Publisher{
 		log:   log,
-		msgCh: make(chan publishMsg, 2000), // bounded async buffer
+		msgCh: make(chan publishMsg, 16000),
 	}
 
-	// open pool of connections+channels
 	for i := range publisherPoolSize {
 		conn, err := dialWithRetry(url, log)
 		if err != nil {
@@ -55,9 +58,8 @@ func NewPublisher(ctx context.Context, url string, log zerolog.Logger) (*Publish
 		}
 		p.channels[i] = ch
 
-		// declare queues on first channel only
 		if i == 0 {
-			for _, name := range []string{QueueTraces, QueueMetrics, QueueLogs} {
+			for _, name := range []string{queue.QueueTraces, queue.QueueMetrics, queue.QueueLogs} {
 				if _, err := ch.QueueDeclare(name, true, false, false, false, nil); err != nil {
 					p.closePartial(i + 1)
 					return nil, err
@@ -69,7 +71,6 @@ func NewPublisher(ctx context.Context, url string, log zerolog.Logger) (*Publish
 	pctx, cancel := context.WithCancel(ctx)
 	p.cancel = cancel
 
-	// start batch publisher workers — one per channel
 	for i := range publisherPoolSize {
 		p.wg.Add(1)
 		go p.batchWorker(pctx, i)
@@ -79,20 +80,20 @@ func NewPublisher(ctx context.Context, url string, log zerolog.Logger) (*Publish
 	return p, nil
 }
 
-// Publish is non-blocking — drops into the async channel.
-// Returns nil immediately. If buffer is full, drops the message.
-func (p *Publisher) Publish(_ context.Context, queue string, body []byte) error {
-	// copy body since fiber reuses the buffer
-	copied := make([]byte, len(body))
-	copy(copied, body)
+func (p *Publisher) Publish(q string, body []byte) {
+	buf := bodyPool.Get().([]byte)
+	if cap(buf) < len(body) {
+		buf = make([]byte, len(body))
+	} else {
+		buf = buf[:len(body)]
+	}
+	copy(buf, body)
 
 	select {
-	case p.msgCh <- publishMsg{queue: queue, body: copied}:
-		return nil
+	case p.msgCh <- publishMsg{queue: q, body: buf}:
 	default:
-		// buffer full — drop message (backpressure)
-		p.log.Warn().Str("queue", queue).Msg("publish buffer full, dropping message")
-		return nil
+		bodyPool.Put(buf[:0])
+		p.log.Warn().Str("queue", q).Msg("publish buffer full, dropping message")
 	}
 }
 
@@ -109,7 +110,6 @@ func (p *Publisher) batchWorker(ctx context.Context, id int) {
 		case <-ctx.Done():
 			p.flushBatch(ch, batch)
 			return
-
 		case msg, ok := <-p.msgCh:
 			if !ok {
 				p.flushBatch(ch, batch)
@@ -121,7 +121,6 @@ func (p *Publisher) batchWorker(ctx context.Context, id int) {
 				batch = batch[:0]
 				timer.Reset(batchFlushDelay)
 			}
-
 		case <-timer.C:
 			if len(batch) > 0 {
 				p.flushBatch(ch, batch)
@@ -136,9 +135,10 @@ func (p *Publisher) flushBatch(ch *amqp.Channel, msgs []publishMsg) {
 	for _, msg := range msgs {
 		err := ch.PublishWithContext(context.Background(), "", msg.queue, false, false, amqp.Publishing{
 			ContentType:  "application/protobuf",
-			DeliveryMode: amqp.Transient, // faster than Persistent for testing
+			DeliveryMode: amqp.Transient,
 			Body:         msg.body,
 		})
+		bodyPool.Put(msg.body[:0])
 		if err != nil {
 			p.log.Error().Err(err).Str("queue", msg.queue).Msg("batch publish failed")
 		}

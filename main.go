@@ -21,19 +21,18 @@ import (
 
 	"dummy-tracers/clickhouse"
 	"dummy-tracers/queue"
+	"dummy-tracers/queue/rabbitmq"
+	"dummy-tracers/queue/redisq"
 )
 
-// analytics counters
+// analytics counters — minimal hot path
 var (
-	totalRequests  atomic.Int64
-	totalBytes     atomic.Int64
-	activeRequests atomic.Int64
-	peakActive     atomic.Int64
-	traceCount     atomic.Int64
-	metricCount    atomic.Int64
-	logCount       atomic.Int64
-	errorCount     atomic.Int64
-	latencySum     atomic.Int64
+	totalRequests atomic.Int64
+	totalBytes    atomic.Int64
+	traceCount    atomic.Int64
+	metricCount   atomic.Int64
+	logCount      atomic.Int64
+	errorCount    atomic.Int64
 )
 
 const maxConcurrent = 1024
@@ -41,6 +40,7 @@ const maxBodySize = 4 * 1024 * 1024
 
 func main() {
 	debug.SetMemoryLimit(350 * 1024 * 1024)
+	debug.SetGCPercent(100)
 
 	log := zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: "15:04:05"}).
 		With().Timestamp().Logger()
@@ -61,39 +61,56 @@ func main() {
 	}
 	defer chClient.Close()
 
-	// rabbitmq
-	rmqURL := envOrDefault("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
 	batchSize := envOrDefaultInt("BATCH_SIZE", 5000)
+	backend := envOrDefault("QUEUE_BACKEND", "rabbitmq")
 
-	publisher, err := queue.NewPublisher(ctx, rmqURL, log)
-	if err != nil {
-		log.Fatal().Err(err).Msg("failed to connect rabbitmq publisher")
-	}
-	defer publisher.Close()
+	var pub queue.Publisher
+	var con queue.Consumer
 
-	consumer, err := queue.NewConsumer(ctx, rmqURL, chClient, batchSize, log)
-	if err != nil {
-		log.Fatal().Err(err).Msg("failed to start rabbitmq consumer")
+	switch backend {
+	case "redis":
+		redisURL := envOrDefault("REDIS_URL", "redis://localhost:6379")
+		pub, err = redisq.NewPublisher(ctx, redisURL, log)
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to connect redis publisher")
+		}
+		con, err = redisq.NewConsumer(ctx, redisURL, chClient, batchSize, log)
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to start redis consumer")
+		}
+	default: // rabbitmq
+		rmqURL := envOrDefault("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+		pub, err = rabbitmq.NewPublisher(ctx, rmqURL, log)
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to connect rabbitmq publisher")
+		}
+		con, err = rabbitmq.NewConsumer(ctx, rmqURL, chClient, batchSize, log)
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to start rabbitmq consumer")
+		}
 	}
-	defer consumer.Close()
+	defer pub.Close()
+	defer con.Close()
+
+	log.Info().Str("backend", backend).Msg("queue backend selected")
 
 	app := fiber.New(fiber.Config{
 		DisableStartupMessage: true,
-		Concurrency:          maxConcurrent * 4,
+		Concurrency:          maxConcurrent * 8,
 		BodyLimit:            maxBodySize,
-		ReadBufferSize:       4096,
-		WriteBufferSize:      4096,
+		ReadBufferSize:       16384,
+		WriteBufferSize:      2048,
 	})
 
-	app.Post("/v1/traces", makeHandler(queue.QueueTraces, &traceCount, publisher))
-	app.Post("/v1/metrics", makeHandler(queue.QueueMetrics, &metricCount, publisher))
-	app.Post("/v1/logs", makeHandler(queue.QueueLogs, &logCount, publisher))
+	app.Post("/v1/traces", makeHandler(queue.QueueTraces, &traceCount, pub))
+	app.Post("/v1/metrics", makeHandler(queue.QueueMetrics, &metricCount, pub))
+	app.Post("/v1/logs", makeHandler(queue.QueueLogs, &logCount, pub))
 	app.Get("/stats", statsHandler())
 
 	go reportStats(log)
 
 	go func() {
-		log.Info().Int("batch_size", batchSize).Msg("listening on :4318")
+		log.Info().Str("backend", backend).Int("batch_size", batchSize).Msg("listening on :4318")
 		if err := app.Listen(":4318"); err != nil {
 			log.Fatal().Err(err).Msg("server failed")
 		}
@@ -106,30 +123,16 @@ func main() {
 	app.Shutdown()
 }
 
-func makeHandler(queueName string, counter *atomic.Int64, pub *queue.Publisher) fiber.Handler {
+func makeHandler(queueName string, counter *atomic.Int64, pub queue.Publisher) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		start := time.Now()
-		active := activeRequests.Add(1)
-		defer activeRequests.Add(-1)
-
-		for {
-			peak := peakActive.Load()
-			if active <= peak || peakActive.CompareAndSwap(peak, active) {
-				break
-			}
-		}
-
 		body, err := decompress(c)
 		if err != nil {
 			errorCount.Add(1)
 			return c.SendStatus(fiber.StatusBadRequest)
 		}
 
-		// async fire-and-forget publish — does not block on RabbitMQ
-		pub.Publish(context.Background(), queueName, body)
+		pub.Publish(queueName, body)
 
-		elapsed := time.Since(start)
-		latencySum.Add(elapsed.Microseconds())
 		totalRequests.Add(1)
 		totalBytes.Add(int64(len(body)))
 		counter.Add(1)
@@ -139,31 +142,31 @@ func makeHandler(queueName string, counter *atomic.Int64, pub *queue.Publisher) 
 }
 
 func statsHandler() fiber.Handler {
-	return func(c *fiber.Ctx) error {
-		var mem runtime.MemStats
-		runtime.ReadMemStats(&mem)
+	// cache mem stats — ReadMemStats causes STW pause, don't call on every request
+	var (
+		cachedMem   runtime.MemStats
+		lastMemRead atomic.Int64
+	)
 
-		total := totalRequests.Load()
-		avgLatency := int64(0)
-		if total > 0 {
-			avgLatency = latencySum.Load() / total
+	return func(c *fiber.Ctx) error {
+		now := time.Now().Unix()
+		if now-lastMemRead.Load() >= 2 {
+			runtime.ReadMemStats(&cachedMem)
+			lastMemRead.Store(now)
 		}
 
 		return c.JSON(fiber.Map{
-			"total_requests":    total,
+			"total_requests":    totalRequests.Load(),
 			"total_bytes":       totalBytes.Load(),
-			"active_requests":   activeRequests.Load(),
-			"peak_concurrent":   peakActive.Load(),
 			"traces":            traceCount.Load(),
 			"metrics":           metricCount.Load(),
 			"logs":              logCount.Load(),
 			"errors":            errorCount.Load(),
-			"avg_latency_us":    avgLatency,
-			"heap_alloc_mb":     mem.HeapAlloc / 1024 / 1024,
+			"heap_alloc_mb":     cachedMem.HeapAlloc / 1024 / 1024,
 			"rss_mb":            getRSSMB(),
 			"goroutines":        runtime.NumGoroutine(),
-			"gc_cycles":         mem.NumGC,
-			"gc_pause_total_ms": mem.PauseTotalNs / 1_000_000,
+			"gc_cycles":         cachedMem.NumGC,
+			"gc_pause_total_ms": cachedMem.PauseTotalNs / 1_000_000,
 		})
 	}
 }
@@ -191,10 +194,10 @@ func reportStats(log zerolog.Logger) {
 				Str("throughput", formatBytes(bps)+"/s").
 				Int64("total", total).
 				Int64("errors", errorCount.Load()).
-				Int64("peak_concurrent", peakActive.Load()).
 				Str("heap", formatBytes(float64(mem.HeapAlloc))).
 				Str("rss", fmt.Sprintf("%dMB", getRSSMB())).
 				Int("goroutines", runtime.NumGoroutine()).
+				Uint32("gc", mem.NumGC).
 				Msg("stats")
 		}
 
